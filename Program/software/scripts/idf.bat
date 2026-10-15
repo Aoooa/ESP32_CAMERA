@@ -13,5 +13,5 @@ set SYSTEMROOT=C:\Windows
 set USERPROFILE=C:\Users\xeno
 set HOME=C:\Users\xeno
 set PATH=C:\Espressif\tools\python\v5.5.3\venv\Scripts;C:\Espressif\tools\xtensa-esp-elf\esp-14.2.0_20251107\xtensa-esp-elf\bin;C:\Espressif\tools\riscv32-esp-elf\esp-14.2.0_20251107\riscv32-esp-elf\bin;C:\Espressif\tools\cmake\3.30.2\bin;C:\Espressif\tools\ninja\1.12.1;%PATH%
-cd /d D:\Task\ESP32_CAMERA
+cd /d D:\Task\ESP32_CAMERA\Program\software
 python D:\esp\v5.5.3\esp-idf\tools\idf.py %*

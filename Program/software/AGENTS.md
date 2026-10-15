@@ -67,7 +67,7 @@ OpenCV 后端必须用 `CAP_MSMF`；`CAP_DSHOW` 打不开本设备。设备同�
 ## 构建 / 烧录 / 调试
 
 ```bash
-cmd //c "D:/Task/ESP32_CAMERA/scripts/idf.bat" build
+cmd //c "D:/Task/ESP32_CAMERA/Program/software/scripts/idf.bat" build
 cmd //c ".../scripts/idf.bat" -p COM14 monitor      # 退出前 Ctrl+]
 python scripts/cam_cmd.py --port COM14 "stat"
 python scripts/cam_dump.py --port COM14 -o out/cam.jpg
@@ -89,6 +89,7 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 | 项 | 值 |
 |---|---|
 | 仓库根 | `D:\Task\ESP32_CAMERA` |
+| 工程根 | `D:\Task\ESP32_CAMERA\Program\software` |
 | 远端 | `git@github.com:Aoooa/ESP32_CAMERA.git` |
 | 分支 | `main`（稳定线）、`dev`（开发线） |
 | committer | `ESP32-Dev <dev@local>` |
