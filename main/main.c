@@ -4,12 +4,14 @@
  *          （Embedded_debug_tool 因 UART1=IO2/IO4、UART2=IO16/IO17、LCD=IO40 与摄像头
  *            DVP 引脚冲突，无法在同一固件里跑摄像头，故独立成工程）。
  *
- * 启动顺序：nvs → SD 挂载（失败不致命）→ 摄像头打开（失败不致命）→ console 任务。
+ * 启动顺序：nvs → SD 挂载（失败不致命）→ UVC 启动 / 摄像头打开（失败不致命）。
  * 不初始化：LCD / 触摸 / UART1 / UART2 / WiFi —— 全部让位给摄像头。
  *
- * 交互：主 console = 原生 USB-Serial/JTAG（板上 USB 口，PC 侧如 COM14），
- *      与 Embedded_debug_tool 的约定一致：单行命令 + 文本回显，可被脚本驱动。
- *      命令见 help。
+ * 交互：两种模式**编译期互斥**（ESP32-S3 的 USB-Serial/JTAG 与 USB-OTG 共用内部 PHY）：
+ *   APP_WITH_USB_UVC = 1（默认）：USB 口做 UVC 摄像头 → PC 侧 scripts/uvc_view.py 看实时画面。
+ *      无 console（日志走 UART0），摄像头由 UVC 任务独占（drv_camera 非线程安全）。
+ *   APP_WITH_USB_UVC = 0：USB 口做 USB-Serial/JTAG console → 原有单行命令测试模式，无视频。
+ *      切回该模式还需把 sdkconfig.defaults 的 console 改回 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y。
  */
 
 #include <dirent.h>
@@ -22,15 +24,30 @@
 #include "freertos/task.h"
 
 #include "app_camera.h"
+#include "app_usb_uvc.h"
+#include "app_video.h"
+#include "app_perf.h"
 #include "drv_camera.h"
 #include "drv_sdcard.h"
 
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_attr.h"
 #include "nvs_flash.h"
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp32s3/rom/usb/usb_persist.h"          /* USBDC_PERSIST_ENA */
+#include "esp32s3/rom/usb/chip_usb_dw_wrapper.h"  /* chip_usb_set_persist_flags */
+#include "esp32s3/rom/usb/usb_dc.h"               /* usb_dc_prepare_persist */
 
 static const char *TAG = "main";
+
+#define APP_WITH_USB_UVC 1
+
+/* 控制台（con_help/con_handle/con_task）两种模式都编译：
+ * UVC 模式下它挂在复合设备的 CDC 串口上（见 app_usb_uvc_*），
+ * 摄像头类命令由 con_handle 里的 guard 拒绝，避免和 UVC 任务抢摄像头。 */
 
 /* "on"/"1" → true */
 static bool parse_on(const char *s)
@@ -42,6 +59,9 @@ static void con_help(void)
 {
     printf("commands:\n");
     printf("  help                     本帮助\n");
+    printf("  uvc on|off               开/关视频流（off 释放摄像头 DMA/帧缓冲）\n");
+    printf("  perf                     测 CPU 余量与调度迟延（含视频开/关对比）\n");
+    printf("  boot                     主机主动进 ROM 下载模式（之后可直接 esptool 烧录）\n");
     printf("  stat                     传感器/参数/累计统计/内存/SD 空间\n");
     printf("  info                     sensor->status 各开关当前值\n");
     printf("  cam on|off               打开/关闭摄像头（off 释放 LCD_CAM+DMA+帧缓冲）\n");
@@ -100,9 +120,19 @@ static void con_ls(const char *dir)
            (unsigned long long)bytes);
 }
 
+/* 两段式进 ROM 下载模式。
+ * 实测结论：`esp_restart()` 从 console 任务调用是**可用**的（相机设备会重新枚举），
+ * 但在 con_task 里直接做"USB 持久化 + 置下载位"那套 ROM/USB 调用会把 USB 栈卡死、
+ * 且下载位不生效。所以拆成两段：
+ *   ① `boot` 命令只置本标志 + esp_restart()；
+ *   ② app_main **最早期**（UVC/CDC 都还没初始化）看到标志就做持久化+置位+重启 ——
+ *      这正是早期诊断版能稳定进下载模式的干净上下文。
+ * RTC_NOINIT 内存跨重启保留，用 magic 防止未初始化值误触发。 */
+#define REBOOT_DL_MAGIC 0x424f4f54u   /* 'BOOT' */
+RTC_NOINIT_ATTR static uint32_t g_reboot_to_dl;
+
 static void con_handle(char *line)
-{
-    char *save = NULL;
+{    char *save = NULL;
     char *cmd = strtok_r(line, " \t", &save);
     if (!cmd) {
         return;
@@ -110,8 +140,33 @@ static void con_handle(char *line)
     char *a1 = strtok_r(NULL, " \t", &save);
     char *a2 = strtok_r(NULL, " \t", &save);
 
+#if APP_WITH_USB_UVC
+    /* UVC 模式下摄像头由 UVC 任务独占（drv_camera 非线程安全），这些命令会跟它抢，
+     * 直接拒绝；其余命令（help/stat/info/ls/sd/clear/reboot/uvc/perf/boot/quality）照常可用。
+     * `quality` 不在此列：它走 app_video 的"待生效请求"，由帧源任务下发，是线程安全的。 */
+    static const char *cam_cmds[] = { "cam", "shot", "burst", "dump",
+                                     "size", "mirror", "flip", "bar" };
+    for (int i = 0; i < (int)(sizeof(cam_cmds) / sizeof(cam_cmds[0])); i++) {
+        if (!strcmp(cmd, cam_cmds[i])) {
+            printf("[con] '%s' 在 UVC 模式下不可用：摄像头归 UVC 任务独占\n", cmd);
+            return;
+        }
+    }
+#endif
+
     if (!strcmp(cmd, "help")) {
         con_help();
+    } else if (!strcmp(cmd, "uvc")) {
+        bool on = !a1 || parse_on(a1);
+        app_video_set_enabled(on);   /* 直接控制"视频源"，与传输无关 */
+        printf("[uvc] 视频流 %s\n", on ? "开" : "关");
+    } else if (!strcmp(cmd, "boot")) {
+        /* 两段式的第一段（见 g_reboot_to_dl 说明）：只置标志 + 重启。
+         * esp_restart() 本身已实测可用；真正的下载模式切换在 app_main 最早期做。 */
+        g_reboot_to_dl = REBOOT_DL_MAGIC;
+        esp_restart();
+    } else if (!strcmp(cmd, "perf")) {
+        app_perf_report();      /* 轻量 CPU 余量/迟延测量，详见 perf/app_perf.h */
     } else if (!strcmp(cmd, "stat")) {
         app_camera_stat();
     } else if (!strcmp(cmd, "info")) {
@@ -135,7 +190,14 @@ static void con_handle(char *line)
     } else if (!strcmp(cmd, "size")) {
         app_camera_set_size(a1);
     } else if (!strcmp(cmd, "quality")) {
-        app_camera_set_quality(a1 ? atoi(a1) : -1);
+        int q = a1 ? atoi(a1) : -1;
+        if (q < 0 || q > 63) {
+            printf("[uvc] quality 现值 = %d（用法 quality <0-63>，越小越清晰、字节越多）\n",
+                   app_video_get_quality());
+        } else {
+            app_video_set_quality(q);   /* 走帧源的"待生效请求"，不跨任务碰 drv_camera */
+            printf("[uvc] quality -> %d（下一帧生效）\n", q);
+        }
     } else if (!strcmp(cmd, "mirror")) {
         app_camera_mirror(parse_on(a1));
     } else if (!strcmp(cmd, "flip")) {
@@ -175,6 +237,9 @@ static void con_task(void *arg)
     while (1) {
         int c = getchar();
         if (c < 0) {
+            c = app_usb_uvc_cdc_getc();   /* 复合设备里的 CDC 串口：同一根 USB 线也能发命令 */
+        }
+        if (c < 0) {
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -194,6 +259,22 @@ static void con_task(void *arg)
 
 void app_main(void)
 {
+    /* 两段式第二段：必须在任何 USB/CDC 初始化之前（见 g_reboot_to_dl 说明）。
+     * 调用顺序照抄 IDF 的 esp_usb_console_before_restart：
+     * 先让 USB-Serial/JTAG 复位后保持，再置下载引导位。 */
+    if (g_reboot_to_dl == REBOOT_DL_MAGIC) {
+        g_reboot_to_dl = 0;
+        usb_dc_prepare_persist();
+        chip_usb_set_persist_flags(USBDC_PERSIST_ENA);
+        REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+        esp_restart();
+    }
+
+    /* 尽早建探针并标定"满速基准"：此刻视频/相机/CDC 都还没起来，基准才干净。
+     * 之后 `perf` 报的"空闲率"就是绝对值（见 perf/app_perf.c）。 */
+    app_perf_init();
+    app_perf_calibrate();
+
     printf("\n===== Camera_test_tool =====\n");
     printf(" board : Waveshare ESP32-S3-Touch-LCD-2 (ESP32-S3, 8MB octal PSRAM)\n");
     printf(" camera: OV5640 DVP  XCLK=8 SIOC=16 SIOD=21 D0-7=%d,%d,%d,%d,%d,%d,%d,%d\n",
@@ -218,6 +299,19 @@ void app_main(void)
                  esp_err_to_name(err));
     }
 
+#if APP_WITH_USB_UVC
+    /* UVC 模式下摄像头由 UVC 任务独占（drv_camera 非线程安全，见 drv_camera.h），
+     * 故这里不预开摄像头、也不起 console 任务 —— 由 UVC 的 start_cb 按主机要求的分辨率打开。 */
+    err = app_usb_uvc_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "USB UVC 启动失败：%s", esp_err_to_name(err));
+    }
+    /* 控制台输出与日志改走复合设备里的 CDC 串口（同一根 USB 线），并起 console 任务收命令 */
+    app_usb_uvc_console_to_cdc();
+    app_usb_uvc_log_to_cdc();
+    xTaskCreate(con_task, "con", 8192, NULL, 4, NULL);
+    printf("\n=== Ready ===  摄像头：python scripts/uvc_view.py；命令：同一根线的 COM 口\n");
+#else
     err = app_camera_open(NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "摄像头打开失败：%s（help / stat / cam on 排查）",
@@ -227,5 +321,6 @@ void app_main(void)
     xTaskCreate(con_task, "con", 8192, NULL, 4, NULL);
 
     printf("\n=== Ready ===  help 查看全部命令；shot 抓一张存卡；dump 把图外发到 PC\n");
+#endif
     fflush(stdout);
 }

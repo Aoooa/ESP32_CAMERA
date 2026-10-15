@@ -754,6 +754,16 @@ camera_fb_t *cam_take(TickType_t timeout)
                 int off = cam_verify_jpeg_eoi(probe_start, probe_len, true);
                 if (off >= 0) {
                     offset_e = dma_buffer->len - probe_len + off;
+                } else {
+                    /* esp32-camera #853 兜底（严格增量）：
+                     * 窄窗口只覆盖帧尾 1025 字节，而 OV3660/OV5640 会在 EOI 之后补零，
+                     * 标记落在窗口外 → offset_e 恒为 -1 → 每帧被丢弃（NO-EOI + timeout）。
+                     * 这里退回"全缓冲反向搜索"：dma_buffer->len = cnt*dma_half_buffer_size，
+                     * [0,len) 全部由本帧 DMA 写入（陈旧字节只在 len 之外），
+                     * 所以反向搜索命中的最后一个标记就是本帧真正的 EOI。
+                     * 上游 v2.1.1~v2.1.8 均未修，issue 里给了同样的建议与硬件验证。 */
+                    cam_drop_psram_cache(dma_buffer->buf, dma_buffer->len);
+                    offset_e = cam_verify_jpeg_eoi(dma_buffer->buf, dma_buffer->len, false);
                 }
             } else {
                 offset_e = cam_verify_jpeg_eoi(dma_buffer->buf, dma_buffer->len, false);

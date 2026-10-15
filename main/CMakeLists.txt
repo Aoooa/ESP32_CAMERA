@@ -6,14 +6,22 @@ idf_component_register(
         "${MODULE_DIR}/camera/drv_camera.c"
         "${MODULE_DIR}/camera/app_camera.c"
         "${MODULE_DIR}/sdcard/drv_sdcard.c"
+        "${MODULE_DIR}/usb_uvc/app_usb_uvc.c"
+        "${MODULE_DIR}/video/app_video.c"
+        "${MODULE_DIR}/perf/app_perf.c"
 
     INCLUDE_DIRS
         "."
         "${MODULE_DIR}/camera"
         "${MODULE_DIR}/sdcard"
+        "${MODULE_DIR}/usb_uvc"
+        "${MODULE_DIR}/video"
+        "${MODULE_DIR}/perf"
 
     PRIV_REQUIRES
         esp32-camera
+        usb_device_uvc
+        espressif__tinyusb
         driver esp_driver_spi esp_driver_sdspi sdmmc fatfs vfs
         nvs_flash heap esp_timer esp_rom log
 )

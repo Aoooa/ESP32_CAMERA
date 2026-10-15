@@ -1,0 +1,17 @@
+# 本工程离线构建：dependencies 段已删除（组件已 vendor 到 components/，依赖见 CMakeLists 的 REQUIRES）。
+# 保留 version: —— CMakeLists 的 cu_pkg_define_version() 从它生成 USB_DEVICE_UVC_VER_* 宏。
+description: USB Device UVC, Streaming Video to Host
+documentation: https://docs.espressif.com/projects/esp-iot-solution/en/latest/usb/usb_device/usb_device_uvc.html
+issues: https://github.com/espressif/esp-iot-solution/issues
+repository: git://github.com/espressif/esp-iot-solution.git
+repository_info:
+  commit_sha: 6a11ddd575777cf5b7722fcd62fd39e18a3372fa
+  path: components/usb/usb_device_uvc
+targets:
+- esp32s2
+- esp32s3
+- esp32s31
+- esp32p4
+- esp32h4
+url: https://github.com/espressif/esp-iot-solution/tree/master/components/usb/usb_device_uvc
+version: 1.3.1
