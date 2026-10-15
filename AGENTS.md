@@ -2,7 +2,6 @@
 
 ESP32-S3 OV5640 摄像头固件（ESP-IDF v5.5.3）。不含 LCD / 触摸 / UART1 / UART2 / WiFi / LVGL。
 视频出口为 **UVC 标准 USB 摄像头 + CDC-ACM 串口复合设备**：一根 USB 线同时提供摄像头与命令/日志口。
-本工程为**独立仓库**，与 `D:\Task\embedded_debugger_tool`（LVGL 调试工具）无关联。
 
 ## 索引
 
@@ -74,7 +73,7 @@ python scripts/cam_cmd.py --port COM14 "stat"
 python scripts/cam_dump.py --port COM14 -o out/cam.jpg
 ```
 
-- `scripts/idf.bat` 已导出 `ESP_ROM_ELF_DIR=C:\Espressif\tools\esp-rom-elfs\20241011`，并 `cd` 到本工程根目录；绕过该包装器直接调 `idf.py` 会因 PATH 与该变量缺失失败。
+- `scripts/idf.bat` 已导出 `ESP_ROM_ELF_DIR` 并 `cd` 到本工程根目录；绕过包装器直接调 `idf.py` 会失败。
 - `sdkconfig.defaults` 改动需 `fullclean && build`；`fullclean` 后先 build 再 flash。
 - 烧录：ROM 下载模式下在 `build/` 执行 `esptool ... write_flash "@flash_args"`，随后 `--after watchdog_reset` 启动应用。
 - 主机侧流程：`boot` 后等约 3 秒再连接 esptool；进入下载模式的判据是出现 PID `0x0009` 的串口。
@@ -89,14 +88,10 @@ Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
 
 | 项 | 值 |
 |---|---|
-| 仓库根 | `D:\Task\ESP32_CAMERA`（独立仓库） |
+| 仓库根 | `D:\Task\ESP32_CAMERA` |
 | 远端 | `git@github.com:Aoooa/ESP32_CAMERA.git` |
 | 分支 | `main`（稳定线）、`dev`（开发线） |
-| 提交信息 | Conventional Commits：`<type>(<scope>): <subject>` |
-| committer | `ESP32-Dev <dev@local>`（`git -c user.name=... -c user.email=... commit`） |
-
-`.gitignore` 排除：`build/`、`sdkconfig`、`sdkconfig.old`、`sdkconfig.bak_console`、
-`dependencies.lock`、`managed_components/`、`out/`、`components/espressif__tinyusb/test/fuzz/**/*.zip`。
+| committer | `ESP32-Dev <dev@local>` |
 
 ## 约束
 
