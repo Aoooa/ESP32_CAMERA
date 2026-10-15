@@ -1,17 +1,5 @@
-/* app_usb_uvc —— UVC 传输适配层。
- *
- * 帧来自 video/app_video（与传输无关的帧源）。本文件只做 UVC 特有的事：
- *   ① 把主机协商的 format/分辨率转给帧源；
- *   ② 主机停止取帧后的空闲保护（用组件的完成帧计数）；
- *   ③ 把帧描述成 uvc_fb_t 交给组件，帧大小上限校验在本传输自己的缓冲上；
- *   ④ 复合设备中的 CDC 串口（命令 / 日志 / stdout 重定向）。
- *
- * USB-OTG 与 USB-Serial/JTAG 共用 ESP32-S3 内部 PHY，二者只能用一个：启用 UVC 后
- * PC 上没有 USB-Serial/JTAG 串口，只有复合设备（相机 + CDC）；烧录用 console 的 `boot`。
- *
- * 线程模型：4 个回调均由 usb_device_uvc 的 UVC 任务调用，故帧源（drv_camera）的
- * 全部操作都发生在该任务内，符合其单线程要求。
- */
+/* app_usb_uvc —— UVC 传输适配层：帧取自 frame_bus，另含复合设备里的 CDC 串口
+ * （命令 / 日志 / stdout 重定向）。4 个回调均由 usb_device_uvc 的 UVC 任务调用。 */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -31,20 +19,19 @@
 
 #include "app_usb_uvc.h"
 #include "app_video.h"
+#include "frame_bus.h"
 
 static const char *TAG = "usb_uvc";
 
-/* 传输缓冲：组件会把每帧 memcpy 进这块缓冲再交给 TinyUSB。
- * 必须是内部 DMA 内存（ESP32-S3 的 USB DMA 到不了 PSRAM）。
- * 这也是"单帧最大可送字节数"的来源 —— 大小上限属于本传输，不属于帧源。 */
+/* 传输缓冲：组件把每帧 memcpy 进来再交 TinyUSB；必须是内部 DMA 内存 */
 #define UVC_BUF_SIZE (75 * 1024)
 
-static bool         s_started;
-static camera_fb_t *s_cam_fb;        /* 当前已抓、尚未归还的帧源帧 */
-static uvc_fb_t     s_uvc_fb;        /* 交给组件的帧描述（buf 指向 s_cam_fb） */
+static bool     s_started;
+static int      s_slot = -1;         /* 当前已取、尚未归还的帧总线槽位 */
+static uint32_t s_last_seq;          /* 上次交给主机的帧序号 */
+static uvc_fb_t s_uvc_fb;
 
-/* "还有没有人在真正取帧"（UVC 特有）：组件的完成帧计数 + 它上次变化的时刻。
- * 只在主机开过流之后（s_feed_armed）才启用。 */
+/* 组件的完成帧计数 + 它上次变化的时刻，只在主机开过流后启用 */
 static uint32_t s_feed_done;
 static uint32_t s_feed_done_ms;
 static bool     s_feed_armed;
@@ -54,7 +41,13 @@ static uint32_t now_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-/* 主机开流：把分辨率交给帧源（传输无关），并复位保护基准 */
+/* 主机在取流吗 */
+bool app_usb_uvc_host_active(void)
+{
+    return s_feed_armed && (now_ms() - s_feed_done_ms) < APP_USB_UVC_FEED_IDLE_MS;
+}
+
+/* 主机开流：投递分辨率并等生效，同时复位保护基准 */
 static esp_err_t on_start(uvc_format_t format, int width, int height, int rate, void *cb_ctx)
 {
     (void)cb_ctx;
@@ -64,16 +57,22 @@ static esp_err_t on_start(uvc_format_t format, int width, int height, int rate, 
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t err = app_video_open(width, height);
-    if (err != ESP_OK) {
-        return err;
-    }
-
-    /* 开流：把判据基准重置到现在。否则下面的保护会拿更早的时刻当基准，
-     * 第一帧就被拒 → 永远没有完成帧 → 永久卡死。 */
+    /* 先武装取帧判据，再投递分辨率请求 */
     s_feed_done    = uvc_device_frame_done_count();
     s_feed_done_ms = now_ms();
     s_feed_armed   = true;
+
+    /* 帧源归帧泵独占：只投递请求并等生效 */
+    if (!app_video_request_size(width, height)) {
+        ESP_LOGE(TAG, "不支持的分辨率 %dx%d", width, height);
+        s_feed_armed = false;
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!app_video_wait_size(width, height, 1000)) {
+        ESP_LOGE(TAG, "帧泵 1s 内未切到 %dx%d", width, height);
+        s_feed_armed = false;
+        return ESP_FAIL;
+    }
 
     ESP_LOGI(TAG, "开流 %dx%d @%dfps", width, height, rate);
     return ESP_OK;
@@ -84,9 +83,9 @@ static uvc_fb_t *on_fb_get(void *cb_ctx)
 {
     (void)cb_ctx;
 
-    /* 主机开过流、但完成帧计数长时间不动 → 主机已停止取帧。
-     * 继续送帧会把传输/端点留给下一次会话一个坏状态，故返回 NULL 让组件跳过本帧。
-     * 判据用完成帧计数：tud_video_n_streaming() 在 bulk 模式下主机设过 alt=1 后恒为 true。 */
+    /* 主机开过流但完成帧计数长时间不动 = 主机已停止取帧：
+     * 返回 NULL 让组件跳过，避免把传输/端点留给下一次会话一个坏状态。
+     * 判据用完成帧计数：tud_video_n_streaming() 在 bulk 模式下恒为 true。 */
     uint32_t done = uvc_device_frame_done_count();
     uint32_t now  = now_ms();
     if (done != s_feed_done) {
@@ -96,34 +95,40 @@ static uvc_fb_t *on_fb_get(void *cb_ctx)
         return NULL;
     }
 
-    s_cam_fb = app_video_get();          /* 传输无关的取帧 */
-    if (!s_cam_fb) {
-        return NULL;                     /* 帧源没帧/被关流，组件会跳过 */
-    }
-
-    if (s_cam_fb->len > UVC_BUF_SIZE) {  /* 上限属于本传输的缓冲 */
-        ESP_LOGW(TAG, "帧 %u 字节 > UVC 缓冲 %d，丢弃", (unsigned)s_cam_fb->len, UVC_BUF_SIZE);
-        app_video_release(s_cam_fb);
-        s_cam_fb = NULL;
+    const uint8_t   *buf;
+    size_t           len;
+    int              w, h;
+    struct timeval   ts;
+    int slot = frame_bus_acquire(&s_last_seq, &buf, &len, &w, &h, &ts);
+    if (slot < 0) {
+        vTaskDelay(1);       /* 组件在返回 NULL 后会立刻重试，故让出 CPU */
         return NULL;
     }
 
-    s_uvc_fb.buf       = s_cam_fb->buf;
-    s_uvc_fb.len       = s_cam_fb->len;
-    s_uvc_fb.width     = s_cam_fb->width;
-    s_uvc_fb.height    = s_cam_fb->height;
+    if (len > UVC_BUF_SIZE) {
+        ESP_LOGW(TAG, "帧 %u 字节 > UVC 缓冲 %d，丢弃", (unsigned)len, UVC_BUF_SIZE);
+        frame_bus_release(slot);
+        return NULL;
+    }
+
+    s_slot = slot;
+    s_uvc_fb.buf       = (uint8_t *)buf;
+    s_uvc_fb.len       = len;
+    s_uvc_fb.width     = (size_t)w;
+    s_uvc_fb.height    = (size_t)h;
     s_uvc_fb.format    = UVC_FORMAT_JPEG;
-    s_uvc_fb.timestamp = s_cam_fb->timestamp;
+    s_uvc_fb.timestamp = ts;
     return &s_uvc_fb;
 }
 
-/* 组件已把帧 memcpy 到自己的传输缓冲（或丢弃）→ 归还给帧源 */
 static void on_fb_return(uvc_fb_t *fb, void *cb_ctx)
 {
     (void)fb;
     (void)cb_ctx;
-    app_video_release(s_cam_fb);
-    s_cam_fb = NULL;
+    if (s_slot >= 0) {
+        frame_bus_release(s_slot);
+        s_slot = -1;
+    }
 }
 
 static void on_stop(void *cb_ctx)

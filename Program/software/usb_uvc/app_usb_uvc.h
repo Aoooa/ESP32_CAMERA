@@ -9,6 +9,8 @@
  * PC 侧用 OpenCV 直接看：python scripts/uvc_view.py（后端只认 CAP_MSMF），
  * 或者直接用系统相机（它是标准 UVC 设备）。 */
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 
 /* "没人在取帧"的判定阈值（ms）：UVC 的完成帧计数超过这么久没动，就返回 NULL
@@ -20,6 +22,9 @@
 /* 启动 UVC 设备（分配传输缓冲 + uvc_device_config + uvc_device_init）。
  * 重复调用返回 ESP_ERR_INVALID_STATE。 */
 esp_err_t app_usb_uvc_start(void);
+
+/* 主机是否正在取流。 */
+bool app_usb_uvc_host_active(void);
 
 /* ---- CDC-ACM（复合设备里的那个串口，与 UVC 共存）---- */
 

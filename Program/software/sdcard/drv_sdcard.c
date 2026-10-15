@@ -1,4 +1,4 @@
-/* drv_sdcard.c —— SD 卡 SPI 模式挂载（本工程独占 SPI2 总线，不含 LCD） */
+/* drv_sdcard.c —— SD 卡 SPI 模式挂载（SPI2 与 LCD 共用，见 bsp/bus_spi2.h） */
 
 #include <errno.h>
 #include <stdio.h>
@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "drv_sdcard.h"
+#include "bus_spi2.h"
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"          /* sdmmc_card_print_info / sdmmc_host_t */
@@ -15,14 +16,10 @@
 
 static const char *TAG = "drv_sdcard";
 
-#define SD_PIN_MOSI  38
-#define SD_PIN_SCLK  39
-#define SD_PIN_MISO  40
 #define SD_PIN_CS    41
 #define SD_SPI_HOST  SPI2_HOST
 
 static sdmmc_card_t *s_card;      /* 非 NULL = 已挂载 */
-static bool          s_bus_owned; /* 总线由本模块初始化，卸载时要释放 */
 
 esp_err_t drv_sdcard_init(void)
 {
@@ -32,21 +29,11 @@ esp_err_t drv_sdcard_init(void)
 
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
 
-    spi_bus_config_t bus = {
-        .mosi_io_num     = SD_PIN_MOSI,
-        .miso_io_num     = SD_PIN_MISO,
-        .sclk_io_num     = SD_PIN_SCLK,
-        .quadwp_io_num   = -1,
-        .quadhd_io_num   = -1,
-        .max_transfer_sz = 4000,     /* 与厂商 01_sd_card_test 例程一致 */
-    };
-    esp_err_t err = spi_bus_initialize(host.slot, &bus, SDSPI_DEFAULT_DMA);
+    /* SPI2 与 LCD 共用：初始化/释放走引用计数 */
+    esp_err_t err = bus_spi2_acquire();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_initialize(SPI%d) failed: %s",
-                 host.slot + 1, esp_err_to_name(err));
         return err;
     }
-    s_bus_owned = true;
 
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.gpio_cs  = SD_PIN_CS;
@@ -59,15 +46,14 @@ esp_err_t drv_sdcard_init(void)
     };
 
     ESP_LOGI(TAG, "mounting SD on SPI%d MOSI=%d SCLK=%d MISO=%d CS=%d -> %s",
-             host.slot + 1, SD_PIN_MOSI, SD_PIN_SCLK, SD_PIN_MISO, SD_PIN_CS,
-             DRV_SDCARD_MOUNT_POINT);
+             host.slot + 1, BUS_SPI2_PIN_MOSI, BUS_SPI2_PIN_SCLK, BUS_SPI2_PIN_MISO,
+             SD_PIN_CS, DRV_SDCARD_MOUNT_POINT);
 
     err = esp_vfs_fat_sdspi_mount(DRV_SDCARD_MOUNT_POINT, &host, &slot, &mount_cfg, &s_card);
     if (err != ESP_OK) {
         /* 挂载失败时 esp_vfs_fat_sdspi_mount 内部已回滚总线上的设备 */
         s_card = NULL;
-        spi_bus_free(SD_SPI_HOST);
-        s_bus_owned = false;
+        bus_spi2_release();
         if (err == ESP_FAIL) {
             ESP_LOGE(TAG, "mount failed: 文件系统不是 FAT/exFAT（或已损坏）");
         } else {
@@ -97,10 +83,7 @@ void drv_sdcard_deinit(void)
         esp_vfs_fat_sdcard_unmount(DRV_SDCARD_MOUNT_POINT, s_card);
         s_card = NULL;
     }
-    if (s_bus_owned) {
-        spi_bus_free(SD_SPI_HOST);
-        s_bus_owned = false;
-    }
+    bus_spi2_release();   /* LCD 还在用时不会真正释放 */
 }
 
 bool drv_sdcard_mounted(void)

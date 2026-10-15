@@ -1,16 +1,15 @@
 /* main.c —— OV5640 摄像头测试工程入口
  *
- * 工程目的：在同一片 Waveshare ESP32-S3-Touch-LCD-2 上单独验证**摄像头驱动 + 图像获取**
- *          （Embedded_debug_tool 因 UART1=IO2/IO4、UART2=IO16/IO17、LCD=IO40 与摄像头
- *            DVP 引脚冲突，无法在同一固件里跑摄像头，故独立成工程）。
+ * 工程目的：在同一片 Waveshare ESP32-S3-Touch-LCD-2 上验证**摄像头驱动 + 图像获取 + 本地显示**
+ *          （Embedded_debug_tool 因 UART1=IO2/IO4、UART2=IO16/IO17 与摄像头 DVP 引脚冲突，
+ *           无法在同一固件里跑摄像头，故独立成工程）。
  *
- * 启动顺序：nvs → SD 挂载（失败不致命）→ UVC 启动 / 摄像头打开（失败不致命）。
- * 不初始化：LCD / 触摸 / UART1 / UART2 / WiFi —— 全部让位给摄像头。
+ * 启动顺序：nvs → SD 挂载（失败不致命）→ LCD 面板 → 帧泵 → UVC 启动（失败不致命）。
+ * 不初始化：触摸 / UART1 / UART2 / WiFi。
  *
- * 交互：两种模式**编译期互斥**（ESP32-S3 的 USB-Serial/JTAG 与 USB-OTG 共用内部 PHY）：
- *   APP_WITH_USB_UVC = 1（默认）：USB 口做 UVC 摄像头 → PC 侧 scripts/uvc_view.py 看实时画面。
- *      无 console（日志走 UART0），摄像头由 UVC 任务独占（drv_camera 非线程安全）。
- *   APP_WITH_USB_UVC = 0：USB 口做 USB-Serial/JTAG console → 原有单行命令测试模式，无视频。
+ * 两种模式**编译期互斥**（ESP32-S3 的 USB-Serial/JTAG 与 USB-OTG 共用内部 PHY）：
+ *   APP_WITH_USB_UVC = 1（默认）：USB 口做 UVC 摄像头 + 本机 LCD 显示同一路视频流。
+ *   APP_WITH_USB_UVC = 0：USB 口做 USB-Serial/JTAG console，无视频、无 LCD。
  *      切回该模式还需把 sdkconfig.defaults 的 console 改回 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y。
  */
 
@@ -24,6 +23,7 @@
 #include "freertos/task.h"
 
 #include "app_camera.h"
+#include "app_lcd.h"
 #include "app_usb_uvc.h"
 #include "app_video.h"
 #include "app_perf.h"
@@ -55,11 +55,22 @@ static bool parse_on(const char *s)
     return s && (!strcmp(s, "on") || !strcmp(s, "1") || !strcmp(s, "true"));
 }
 
+/* 帧泵要不要出帧：LCD 在显示，或有主机在取流 */
+static bool pump_need_frames(void)
+{
+    return app_lcd_enabled() || app_usb_uvc_host_active();
+}
+
 static void con_help(void)
 {
     printf("commands:\n");
     printf("  help                     本帮助\n");
     printf("  uvc on|off               开/关视频流（off 释放摄像头 DMA/帧缓冲）\n");
+    printf("  lcd                      显示统计\n");
+    printf("  lcd on|off               开/关 LCD 显示（off 不再解码，面板保持点亮）\n");
+    printf("  lcd fill [r|g|b|w|k]    全屏纯色（无参：红→绿→蓝→白→黑依次）\n");
+    printf("  lcd test                 4 条横带：上→下 红/绿/蓝/白\n");
+    printf("  lcd bench [n]            全屏动画刷 n 帧（默认 200），报帧率/带宽\n");
     printf("  perf                     测 CPU 余量与调度迟延（含视频开/关对比）\n");
     printf("  boot                     主机主动进 ROM 下载模式（之后可直接 esptool 烧录）\n");
     printf("  stat                     传感器/参数/累计统计/内存/SD 空间\n");
@@ -157,6 +168,20 @@ static void con_handle(char *line)
         bool on = !a1 || parse_on(a1);
         app_video_set_enabled(on);   /* 直接控制"视频源"，与传输无关 */
         printf("[uvc] 视频流 %s\n", on ? "开" : "关");
+    } else if (!strcmp(cmd, "lcd")) {
+        if (a1 && !strcmp(a1, "test")) {
+            app_lcd_test_pattern();
+        } else if (a1 && !strcmp(a1, "bench")) {
+            app_lcd_bench(a2 ? atoi(a2) : 200);
+        } else if (a1 && !strcmp(a1, "fill")) {
+            app_lcd_fill(a2);
+        } else if (a1) {
+            bool on = parse_on(a1);
+            app_lcd_set_enabled(on);
+            printf("[lcd] 显示 %s\n", on ? "开" : "关");
+        } else {
+            app_lcd_report();
+        }
     } else if (!strcmp(cmd, "boot")) {
         /* 两段式第一段：置标志 + 重启；下载模式的切换在 app_main 最早期执行。 */
         g_reboot_to_dl = REBOOT_DL_MAGIC;
@@ -280,7 +305,8 @@ void app_main(void)
            DRV_CAMERA_PIN_VSYNC, DRV_CAMERA_PIN_HREF, DRV_CAMERA_PIN_PCLK,
            DRV_CAMERA_PIN_PWDN, DRV_CAMERA_PIN_RESET);
     printf(" sdcard: SPI2 MOSI=38 SCLK=39 MISO=40 CS=41 -> %s\n", DRV_SDCARD_MOUNT_POINT);
-    printf(" 不初始化 LCD/触摸/UART1/UART2（与摄像头 DVP 引脚冲突，见 drv_camera.h）\n");
+    printf(" lcd   : ST7789 240x320 SPI2 SCLK=39 MOSI=38 DC=42 CS=45 BL=1（与 SD 共用总线）\n");
+    printf(" 不初始化 触摸/UART1/UART2\n");
 
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -296,8 +322,13 @@ void app_main(void)
     }
 
 #if APP_WITH_USB_UVC
-    /* UVC 模式下摄像头由 UVC 任务独占（drv_camera 非线程安全，见 drv_camera.h），
-     * 故这里不预开摄像头、也不起 console 任务 —— 由 UVC 的 start_cb 按主机要求的分辨率打开。 */
+    /* 顺序：LCD → 帧泵 → UVC */
+    err = app_lcd_start();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "LCD 初始化失败：%s", esp_err_to_name(err));
+    }
+    app_video_pump_start(pump_need_frames);
+
     err = app_usb_uvc_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "USB UVC 启动失败：%s", esp_err_to_name(err));

@@ -1,9 +1,14 @@
 /* app_video —— 与传输无关的视频帧源。见 app_video.h。 */
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "app_video.h"
 #include "drv_camera.h"
+#include "frame_bus.h"
 
 static const char *TAG = "app_video";
 
@@ -15,6 +20,14 @@ static volatile int s_quality_req = -1;
 
 static volatile uint32_t s_frames_out;
 static volatile uint32_t s_bytes_out;
+
+/* 帧泵 + 分辨率请求 */
+static TaskHandle_t s_pump;
+static bool       (*s_need_frames)(void);
+static volatile bool s_size_req;
+static volatile bool s_size_req_done;
+static volatile int  s_size_req_w;
+static volatile int  s_size_req_h;
 
 bool app_video_framesize_from_wh(int w, int h, framesize_t *out)
 {
@@ -161,3 +174,101 @@ int app_video_get_quality(void)
 {
     return (s_quality_req >= 0) ? s_quality_req : s_quality;
 }
+
+/* ---------------- 帧泵：唯一取帧者，把每帧发布到帧总线 ---------------- */
+
+bool app_video_request_size(int width, int height)
+{
+    framesize_t fs;
+    if (!app_video_framesize_from_wh(width, height, &fs)) {
+        return false;
+    }
+    s_size_req_w    = width;
+    s_size_req_h    = height;
+    s_size_req_done = false;
+    s_size_req      = true;
+    return true;
+}
+
+bool app_video_wait_size(int width, int height, int timeout_ms)
+{
+    int64_t t0 = esp_timer_get_time();
+
+    while ((esp_timer_get_time() - t0) < (int64_t)timeout_ms * 1000) {
+        if (!s_size_req && s_w == width && s_h == height && drv_camera_ready()) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return false;
+}
+
+/* 在帧泵上下文应用分辨率请求 */
+static void pump_apply_size(void)
+{
+    int w = s_size_req_w;
+    int h = s_size_req_h;
+    s_size_req = false;
+
+    esp_err_t err = app_video_open(w, h);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "帧泵切到 %dx%d 失败：%s", w, h, esp_err_to_name(err));
+    }
+    s_size_req_done = true;
+}
+
+static void pump_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        if (s_size_req) {
+            pump_apply_size();
+        }
+
+        /* 关流：仍调一次 get()，关摄像头动作发生在帧泵上下文 */
+        if (!s_enabled) {
+            app_video_get();
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        /* 没有消费者要帧：不取帧 */
+        if (s_need_frames && !s_need_frames()) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        camera_fb_t *fb = app_video_get();
+        if (!fb) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+        frame_bus_publish(fb->buf, fb->len, fb->width, fb->height, fb->timestamp);
+        app_video_release(fb);
+    }
+}
+
+void app_video_pump_start(bool (*need_frames)(void))
+{
+    if (s_pump) {
+        return;
+    }
+    s_need_frames = need_frames;
+
+    if (frame_bus_init(APP_VIDEO_BUS_SLOT_LEN) != ESP_OK) {
+        ESP_LOGE(TAG, "帧总线初始化失败，视频流不可用");
+        return;
+    }
+
+    /* 默认 QVGA；主机开流时可再改 */
+    app_video_request_size(320, 240);
+
+    if (xTaskCreatePinnedToCore(pump_task, "vpump", 4096, NULL, 4, &s_pump, 0) != pdPASS) {
+        s_pump = NULL;
+        ESP_LOGE(TAG, "帧泵任务创建失败");
+        return;
+    }
+    ESP_LOGI(TAG, "帧泵已启动（core 0, prio 4）");
+}
+

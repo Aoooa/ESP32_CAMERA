@@ -1,21 +1,8 @@
 #ifndef APP_VIDEO_H
 #define APP_VIDEO_H
 
-/* app_video —— 与传输无关的视频帧源。
- *
- * 只与 esp32-camera（drv_camera）交互；UVC 是当前唯一消费者，接入其他通信方式时
- * 复用本接口，只增加对应适配层：
- *
- *     消费者(传输层)                     帧源
- *     ─────────────────                ─────────────
- *     协议里的 宽/高      ──open()──▶  按分辨率打开/重配摄像头
- *     取一帧              ──get()───▶  抓一帧 JPEG（失败返回 NULL）
- *     归还                ──release()─▶ 归还帧缓冲
- *     开关 / 统计          ──set_enabled() / get_stats()
- *
- * 线程模型：drv_camera 非线程安全，所有接口须在同一个任务里调用（UVC 模式下即 UVC 任务）。
- * 帧大小上限属于各消费者（缓冲大小不同），本模块只校验"是否 JPEG / 长度是否为 0"。
- */
+/* app_video —— 与传输无关的视频帧源：帧泵独占取帧并发布到 frame_bus，
+ * 消费者（usb_uvc / app_lcd）各自取帧。分辨率请求由消费者投递，在帧泵上下文落到摄像头。 */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,7 +10,20 @@
 #include "esp_err.h"
 #include "esp_camera.h"
 
-/* 按给定分辨率打开/重配摄像头。 */
+/* 帧总线单槽容量 */
+#define APP_VIDEO_BUS_SLOT_LEN (128 * 1024)
+
+/* 起帧泵任务（唯一取帧者）+ 初始化帧总线。need_frames 由 main 注入，
+ * 返回 false 时帧泵不取帧。 */
+void app_video_pump_start(bool (*need_frames)(void));
+
+/* 消费者投递分辨率请求（线程安全）。false = 不支持该分辨率。 */
+bool app_video_request_size(int width, int height);
+
+/* 等分辨率请求被帧泵应用完成（毫秒超时）。 */
+bool app_video_wait_size(int width, int height, int timeout_ms);
+
+/* 按给定分辨率打开/重配摄像头。只能在帧泵上下文调用。 */
 esp_err_t app_video_open(int width, int height);
 
 /* 摄像头是否已就绪。 */
