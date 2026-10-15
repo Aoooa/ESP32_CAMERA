@@ -91,9 +91,7 @@ static void perf_task(void *arg)
 
 void app_perf_init(void)
 {
-    /* 必须钉核：esp32-camera 的 cam_task 优先级是 configMAX_PRIORITIES-2 且钉在 core 0
-     * （CONFIG_CAMERA_CORE0=y），探针若乱跑会跟它抢同一个核，把被测系统扰动掉
-     * （实测未钉核时视频从 48fps 掉到 22fps）。所以钉到 core 1。 */
+    /* 钉 core 1：cam_task 钉在 core 0（CONFIG_CAMERA_CORE0=y），探针不与其竞争。 */
     xTaskCreatePinnedToCore(perf_task, "perf", PERF_TASK_STACK, NULL,
                             PERF_SPIN_PRIO, NULL, 1);
 }
@@ -107,10 +105,8 @@ static void perf_run(int phase)
     }
 }
 
-/* 启动早期标定"满速基准"：那时视频/相机/CDC 都还没起来，探针能拿到≈全部 CPU。
- * 之后每次 perf 用同一窗口测，比值就是**绝对空闲率**，不必再两次相除
- * （旧版在同一次测量里自己关开视频流做 A/B，两次相位条件不等价 —— 实测两次结果
- * 相差 130 倍，该做法已废弃）。 */
+/* 启动早期标定满速基准：此时视频/相机/CDC 均未初始化，探针可获得约全部 CPU。
+ * 之后每次 perf 用同一窗口测量，比值即绝对空闲率。 */
 void app_perf_calibrate(void)
 {
     perf_run(PERF_PH_SPIN);

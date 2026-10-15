@@ -120,13 +120,10 @@ static void con_ls(const char *dir)
            (unsigned long long)bytes);
 }
 
-/* 两段式进 ROM 下载模式。
- * 实测结论：`esp_restart()` 从 console 任务调用是**可用**的（相机设备会重新枚举），
- * 但在 con_task 里直接做"USB 持久化 + 置下载位"那套 ROM/USB 调用会把 USB 栈卡死、
- * 且下载位不生效。所以拆成两段：
- *   ① `boot` 命令只置本标志 + esp_restart()；
- *   ② app_main **最早期**（UVC/CDC 都还没初始化）看到标志就做持久化+置位+重启 ——
- *      这正是早期诊断版能稳定进下载模式的干净上下文。
+/* 两段式进入 ROM 下载模式。
+ * ① `boot` 命令：只置本标志 + esp_restart()；
+ * ② `app_main` 最早期（UVC/CDC 尚未初始化）：置 USB 持久化标志与下载引导位后重启。
+ * 拆分原因：ROM 的 USB 函数假定 ROM 独占 USB 控制器，在 TinyUSB 已初始化后调用会死锁。
  * RTC_NOINIT 内存跨重启保留，用 magic 防止未初始化值误触发。 */
 #define REBOOT_DL_MAGIC 0x424f4f54u   /* 'BOOT' */
 RTC_NOINIT_ATTR static uint32_t g_reboot_to_dl;
@@ -161,8 +158,7 @@ static void con_handle(char *line)
         app_video_set_enabled(on);   /* 直接控制"视频源"，与传输无关 */
         printf("[uvc] 视频流 %s\n", on ? "开" : "关");
     } else if (!strcmp(cmd, "boot")) {
-        /* 两段式的第一段（见 g_reboot_to_dl 说明）：只置标志 + 重启。
-         * esp_restart() 本身已实测可用；真正的下载模式切换在 app_main 最早期做。 */
+        /* 两段式第一段：置标志 + 重启；下载模式的切换在 app_main 最早期执行。 */
         g_reboot_to_dl = REBOOT_DL_MAGIC;
         esp_restart();
     } else if (!strcmp(cmd, "perf")) {
@@ -259,9 +255,9 @@ static void con_task(void *arg)
 
 void app_main(void)
 {
-    /* 两段式第二段：必须在任何 USB/CDC 初始化之前（见 g_reboot_to_dl 说明）。
-     * 调用顺序照抄 IDF 的 esp_usb_console_before_restart：
-     * 先让 USB-Serial/JTAG 复位后保持，再置下载引导位。 */
+    /* 两段式第二段：必须在任何 USB/CDC 初始化之前执行。
+     * 顺序与 IDF 的 esp_usb_console_before_restart 一致：先置 USB-Serial/JTAG 持久化
+     * 标志，再置下载引导位。 */
     if (g_reboot_to_dl == REBOOT_DL_MAGIC) {
         g_reboot_to_dl = 0;
         usb_dc_prepare_persist();

@@ -1,19 +1,16 @@
 /* app_usb_uvc —— UVC 传输适配层。
  *
- * 帧来自 video/app_video（**与传输无关的帧源**）；本文件只做 UVC 特有的事：
+ * 帧来自 video/app_video（与传输无关的帧源）。本文件只做 UVC 特有的事：
  *   ① 把主机协商的 format/分辨率转给帧源；
- *   ② "没人取帧就别送帧"的保护（用组件的完成帧计数，UVC 特有）；
- *   ③ 把帧描述成 uvc_fb_t 交给组件，并把上限校验在**本传输自己的缓冲**上；
- *   ④ 复合设备里那个 CDC 串口（命令 + 日志，见下）。
+ *   ② 主机停止取帧后的空闲保护（用组件的完成帧计数）；
+ *   ③ 把帧描述成 uvc_fb_t 交给组件，帧大小上限校验在本传输自己的缓冲上；
+ *   ④ 复合设备中的 CDC 串口（命令 / 日志 / stdout 重定向）。
  *
- * 以后加别的通信方式时：照本文件的形状再写一个适配层即可，帧源不用改。
+ * USB-OTG 与 USB-Serial/JTAG 共用 ESP32-S3 内部 PHY，二者只能用一个：启用 UVC 后
+ * PC 上没有 USB-Serial/JTAG 串口，只有复合设备（相机 + CDC）；烧录用 console 的 `boot`。
  *
- * ⚠️ USB-OTG 与 USB-Serial/JTAG 共用 ESP32-S3 的内部 PHY，二者只能用一个：
- *    本工程启用 UVC 后 **PC 上没有 USB-Serial/JTAG 串口**，只有一个复合设备
- *    （相机 + CDC）。要烧录用 console 的 `boot` 命令进 ROM 下载模式。
- *
- * 线程模型：4 个回调都由 usb_device_uvc 的 UVC 任务调用，故帧源（drv_camera）
- *          的全部操作都在那一个任务里，符合它的单线程要求。
+ * 线程模型：4 个回调均由 usb_device_uvc 的 UVC 任务调用，故帧源（drv_camera）的
+ * 全部操作都发生在该任务内，符合其单线程要求。
  */
 
 #include "freertos/FreeRTOS.h"
@@ -87,12 +84,9 @@ static uvc_fb_t *on_fb_get(void *cb_ctx)
 {
     (void)cb_ctx;
 
-    /* 主机开过流、但完成帧计数长时间不动 → 没人在真正取帧了。
-     * 继续送帧会把传输/端点留给下一次会话一个坏状态：现象是"关掉摄像头再打开
-     * 永久 0 帧，只有复位才能好"。返回 NULL，组件会跳过本帧、不起传输。
-     *
-     * 判据必须用完成帧计数，不能用 tud_video_n_streaming()：后者在 bulk 模式下
-     * 主机设过一次 alt=1 就锁死为 true（Windows 关掉播放器也不发 SET_INTERFACE(alt=0)）。 */
+    /* 主机开过流、但完成帧计数长时间不动 → 主机已停止取帧。
+     * 继续送帧会把传输/端点留给下一次会话一个坏状态，故返回 NULL 让组件跳过本帧。
+     * 判据用完成帧计数：tud_video_n_streaming() 在 bulk 模式下主机设过 alt=1 后恒为 true。 */
     uint32_t done = uvc_device_frame_done_count();
     uint32_t now  = now_ms();
     if (done != s_feed_done) {
@@ -188,10 +182,8 @@ static ssize_t cdc_vfs_write(int fd, const void *data, size_t size)
         (void)tud_cdc_n_write(0, data, size);   /* 能塞多少塞多少 */
         (void)tud_cdc_n_write_flush(0);
     }
-    /* ⚠️ 必须**永远报告"全部写完"**，绝不能返回短计数：
-     * newlib/fflush 遇到短写会一直重试，而 esp_restart() 会 flush 控制台 ——
-     * 一旦 CDC 发送 FIFO 满（主机没读），重试就变成死循环，命令会卡死在那里。
-     * 宁可丢日志，也不能返回短计数。 */
+    /* 必须始终返回完整长度。newlib/fflush 遇到短写会反复重试，而 esp_restart() 会 flush
+     * 控制台 —— CDC 发送 FIFO 满时该重试即变死循环，命令无法返回。 */
     return (ssize_t)size;
 }
 
