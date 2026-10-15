@@ -62,7 +62,7 @@ OpenCV 后端必须用 `CAP_MSMF`；`CAP_DSHOW` 打不开本设备。设备同�
 ## 构建 / 烧录 / 调试
 
 ```bash
-cmd //c "D:/Task/embedded_debugger_tool/Program/Camera_test_tool/scripts/idf.bat" build
+cmd //c "D:/Task/ESP32_CAMERA/scripts/idf.bat" build
 cmd //c ".../scripts/idf.bat" -p COM14 monitor      # 退出前 Ctrl+]
 python scripts/cam_cmd.py --port COM14 "stat"
 python scripts/cam_dump.py --port COM14 -o out/cam.jpg

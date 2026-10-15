@@ -1,4 +1,4 @@
-# ESP-IDF 构建产物
+# ESP-IDF build artifacts
 build/
 **/build/
 *.o
@@ -9,6 +9,7 @@ build/
 flasher_args.json
 sdkconfig
 sdkconfig.old
+sdkconfig.bak_console
 dependencies.lock
 managed_components/
 .espressif/
@@ -17,7 +18,7 @@ managed_components/
 __pycache__/
 *.pyc
 
-# 编辑器 / 语言服务器
+# Tooling
 .clangd/
 compile_commands.json
 .vscode/.browse*
@@ -25,5 +26,8 @@ Thumbs.db
 *.tmp
 *~
 
-# PC 侧抓图输出（cam_dump.py 落盘的 jpg）
+# PC-side captured images
 out/
+
+# Vendored TinyUSB fuzz corpora (test fixtures, not needed for build)
+components/espressif__tinyusb/test/fuzz/**/*.zip

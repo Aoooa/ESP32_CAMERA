@@ -75,7 +75,7 @@ python scripts/cam_dump.py --port COM14 --frames 3 --outdir out
 ## 构建 / 烧录
 
 ```bash
-cmd //c "D:/Task/embedded_debugger_tool/Program/Camera_test_tool/scripts/idf.bat" build
+cmd //c "D:/Task/ESP32_CAMERA/scripts/idf.bat" build
 ```
 
 - 改 `sdkconfig` 触发重配置时先设 `ESP_ROM_ELF_DIR=C:\Espressif\tools\esp-rom-elfs\20241011`。
